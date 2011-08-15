@@ -8,7 +8,9 @@
 
 phutil_require_module('arcanist', 'repository/api/base');
 
+phutil_require_module('phutil', 'future');
 phutil_require_module('phutil', 'future/exec');
+phutil_require_module('phutil', 'utils');
 
 
 phutil_require_source('ArcanistGitAPI.php');

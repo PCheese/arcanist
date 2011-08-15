@@ -183,17 +183,47 @@ class ArcanistGitAPI extends ArcanistRepositoryAPI {
 
       $options = $this->getDiffBaseOptions();
 
+      // -- parallelize these slow cpu bound git calls.
+
       // Find committed changes.
-      list($stdout) = execx(
+      $committed_future = new ExecFuture(
         "(cd %s; git diff {$options} --raw %s --)",
         $this->getPath(),
         $this->getRelativeCommit());
-      $files = $this->parseGitStatus($stdout);
 
       // Find uncommitted changes.
-      list($stdout) = execx(
+      $uncommitted_future = new ExecFuture(
         "(cd %s; git diff {$options} --raw HEAD --)",
         $this->getPath());
+
+      // Untracked files
+      $untracked_future = new ExecFuture(
+        '(cd %s; git ls-files --others --exclude-standard)',
+        $this->getPath());
+
+      // TODO: This doesn't list unstaged adds. It's not clear how to get that
+      // list other than "git status --porcelain" and then parsing it. :/
+
+      // Unstaged changes
+      $unstaged_future = new ExecFuture(
+        '(cd %s; git ls-files -m)',
+        $this->getPath());
+
+      $futures = array(
+        $committed_future,
+        $uncommitted_future,
+        $untracked_future,
+        $unstaged_future
+      );
+      Futures($futures)->resolveAll();
+
+
+      // -- read back and process the results
+
+      list($stdout, $stderr) = $committed_future->resolvex();
+      $files = $this->parseGitStatus($stdout);
+
+      list($stdout, $stderr) = $uncommitted_future->resolvex();
       $uncommitted_files = $this->parseGitStatus($stdout);
       foreach ($uncommitted_files as $path => $mask) {
         $mask |= self::FLAG_UNCOMMITTED;
@@ -203,10 +233,7 @@ class ArcanistGitAPI extends ArcanistRepositoryAPI {
         $files[$path] |= $mask;
       }
 
-      // Find untracked files.
-      list($stdout) = execx(
-        '(cd %s; git ls-files --others --exclude-standard)',
-        $this->getPath());
+      list($stdout, $stderr) = $untracked_future->resolvex();
       $stdout = rtrim($stdout, "\n");
       if (strlen($stdout)) {
         $stdout = explode("\n", $stdout);
@@ -215,13 +242,7 @@ class ArcanistGitAPI extends ArcanistRepositoryAPI {
         }
       }
 
-      // TODO: This doesn't list unstaged adds. It's not clear how to get that
-      // list other than "git status --porcelain" and then parsing it. :/
-
-      // Find unstaged changes.
-      list($stdout) = execx(
-        '(cd %s; git ls-files -m)',
-        $this->getPath());
+      list($stdout, $stderr) = $unstaged_future->resolvex();
       $stdout = rtrim($stdout, "\n");
       if (strlen($stdout)) {
         $stdout = explode("\n", $stdout);
@@ -296,7 +317,7 @@ class ArcanistGitAPI extends ArcanistRepositoryAPI {
   public function getBlame($path) {
     // TODO: 'git blame' supports --porcelain and we should probably use it.
     list($stdout) = execx(
-      '(cd %s; git blame -w -C %s -- %s)',
+      '(cd %s; git blame --date=iso -w -C %s -- %s)',
       $this->getPath(),
       $this->getRelativeCommit(),
       $path);
@@ -396,6 +417,71 @@ class ArcanistGitAPI extends ArcanistRepositoryAPI {
        $this->getPath(),
        $info[$path]['ref']);
     return $stdout;
+  }
+
+  /**
+   * Returns names of all the branches in the current repository.
+   *
+   * @return array where each element is a triple ('name', 'sha1', 'current')
+   */
+  public function getAllBranches() {
+    list($branch_info) = execx(
+      'cd %s && git branch --no-color', $this->getPath());
+    $lines = explode("\n", trim($branch_info));
+    $result = array();
+    foreach ($lines as $line) {
+      $match = array();
+      preg_match('/^(\*?)\s*(.*)$/', $line, $match);
+      $name = $match[2];
+      if ($name == '(no branch)') {
+        // Just ignore this, we could theoretically try to figure out the ref
+        // and treat it like a real branch but that's sort of ridiculous.
+        continue;
+      }
+      $result[] = array(
+        'current' => !empty($match[1]),
+        'name'    => $name,
+      );
+    }
+    $all_names = ipull($result, 'name');
+    // Calling 'git branch' first and then 'git rev-parse' is way faster than
+    // 'git branch -v' for some reason.
+    list($sha1s_string) = execx(
+      "cd %s && git rev-parse %Ls",
+      $this->path,
+      $all_names);
+    $sha1_map = array_combine($all_names, explode("\n", trim($sha1s_string)));
+    foreach ($result as &$branch) {
+      $branch['sha1'] = $sha1_map[$branch['name']];
+    }
+    return $result;
+  }
+
+  /**
+   * Returns git commit messages for the given revisions,
+   * in the specified format (see git show --help for options).
+   *
+   * @param array $revs a list of commit hashes
+   * @param string $format the format to show messages in
+   */
+  public function multigetCommitMessages($revs, $format) {
+    $delimiter = "%%x00";
+    $revs_list = implode(' ', $revs);
+    $show_command =
+      "git show -s --pretty=\"format:$format$delimiter\" $revs_list";
+    list($commits_string) = execx(
+      "cd %s && $show_command",
+      $this->getPath());
+    $commits_list = array_slice(explode("\0", $commits_string), 0, -1);
+    $commits_list = array_combine($revs, $commits_list);
+    return $commits_list;
+  }
+
+  public function getRepositoryOwner() {
+    list($owner) = execx(
+      'cd %s && git config --get user.name',
+      $this->getPath());
+    return trim($owner);
   }
 
 }

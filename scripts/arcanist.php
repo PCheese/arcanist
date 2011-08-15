@@ -61,6 +61,7 @@ if (function_exists('posix_isatty') && !posix_isatty(STDOUT)) {
 }
 
 $args = array_values($args);
+$working_directory = $_SERVER['PWD'];
 
 try {
 
@@ -72,7 +73,7 @@ try {
     throw new ArcanistUsageException("No command provided. Try 'arc help'.");
   }
 
-  $working_copy = ArcanistWorkingCopyIdentity::newFromPath($_SERVER['PWD']);
+  $working_copy = ArcanistWorkingCopyIdentity::newFromPath($working_directory);
   if ($load) {
     $libs = $load;
   } else {
@@ -80,15 +81,47 @@ try {
   }
   if ($libs) {
     foreach ($libs as $name => $location) {
-      if ($config_trace_mode) {
-        echo "Loading phutil library '{$name}' from '{$location}'...\n";
-      }
+
+      // Try to resolve the library location. We look in several places, in
+      // order:
+      //
+      //  1. Inside the working copy. This is for phutil libraries within the
+      //     project. For instance "library/src" will resolve to
+      //     "./library/src" if it exists.
+      //  2. In the same directory as the working copy. This allows you to
+      //     check out a library alongside a working copy and reference it.
+      //     If we haven't resolved yet, "library/src" will try to resolve to
+      //     "../library/src" if it exists.
+      //  3. Using normal libphutil resolution rules. Generally, this means
+      //     that it checks for libraries next to libphutil, then libraries
+      //     in the PHP include_path.
+
+      $resolved = false;
+
+      // Check inside the working copy.
       $resolved_location = Filesystem::resolvePath(
         $location,
         $working_copy->getProjectRoot());
       if (Filesystem::pathExists($resolved_location)) {
         $location = $resolved_location;
+        $resolved = true;
       }
+
+      // If we didn't find anything, check alongside the working copy.
+      if (!$resolved) {
+        $resolved_location = Filesystem::resolvePath(
+          $location,
+          dirname($working_copy->getProjectRoot()));
+        if (Filesystem::pathExists($resolved_location)) {
+          $location = $resolved_location;
+          $resolved = true;
+        }
+      }
+
+      if ($config_trace_mode) {
+        echo "Loading phutil library '{$name}' from '{$location}'...\n";
+      }
+
       try {
         phutil_load_library($location);
       } catch (PhutilBootloaderException $ex) {
@@ -118,16 +151,7 @@ try {
     }
   }
 
-  $user_config = array();
-  $user_config_path = getenv('HOME').'/.arcrc';
-  if (Filesystem::pathExists($user_config_path)) {
-    $user_config_data = Filesystem::readFile($user_config_path);
-    $user_config = json_decode($user_config_data, true);
-    if (!is_array($user_config)) {
-      throw new ArcanistUsageException(
-        "Your '~/.arcrc' file is not a valid JSON file.");
-    }
-  }
+  $user_config = ArcanistBaseWorkflow::readUserConfigurationFile();
 
   $config = $working_copy->getConfig('arcanist_configuration');
   if ($config) {
@@ -145,6 +169,7 @@ try {
   }
   $workflow->setArcanistConfiguration($config);
   $workflow->setCommand($command);
+  $workflow->setWorkingDirectory($working_directory);
   $workflow->parseArguments(array_slice($args, 1));
 
   $need_working_copy    = $workflow->requiresWorkingCopy();
@@ -168,74 +193,57 @@ try {
     $workflow->setWorkingCopy($working_copy);
   }
 
-  $set_guid = false;
-  if ($need_conduit) {
 
-    if ($force_conduit) {
-      $conduit_uri = $force_conduit;
-    } else {
-      $conduit_uri = $working_copy->getConduitURI();
-    }
+  if ($force_conduit) {
+    $conduit_uri = $force_conduit;
+  } else {
+    $conduit_uri = $working_copy->getConduitURI();
+  }
+  if ($conduit_uri) {
+    // Set the URI path to '/api/'. TODO: Originally, I contemplated letting
+    // you deploy Phabricator somewhere other than the domain root, but ended
+    // up never pursuing that. We should get rid of all "/api/" silliness
+    // in things users are expected to configure. This is already happening
+    // to some degree, e.g. "arc install-certificate" does it for you.
+    $conduit_uri = new PhutilURI($conduit_uri);
+    $conduit_uri->setPath('/api/');
+    $conduit_uri = (string)$conduit_uri;
+  }
+  $workflow->setConduitURI($conduit_uri);
+
+  if ($need_conduit) {
     if (!$conduit_uri) {
       throw new ArcanistUsageException(
         "No Conduit URI is specified in the .arcconfig file for this project. ".
         "Specify the Conduit URI for the host Differential is running on.");
     }
-    $conduit = new ConduitClient($conduit_uri);
-    $workflow->setConduit($conduit);
+    $workflow->establishConduit();
+  }
 
-    $hosts_config = idx($user_config, 'hosts', array());
-    $host_config = idx($hosts_config, $conduit_uri, array());
-    $user_name = idx($host_config, 'user', getenv('USER'));
-    $certificate = idx($host_config, 'cert');
+  $hosts_config = idx($user_config, 'hosts', array());
+  $host_config = idx($hosts_config, $conduit_uri, array());
+  $user_name = idx($host_config, 'user');
+  $certificate = idx($host_config, 'cert');
 
-    $description = implode(' ', $argv);
+  $description = implode(' ', $argv);
+  $credentials = array(
+    'user'        => $user_name,
+    'certificate' => $certificate,
+    'description' => $description,
+  );
+  $workflow->setConduitCredentials($credentials);
 
-    try {
-      $connection = $conduit->callMethodSynchronous(
-        'conduit.connect',
-        array(
-          'client'            => 'arc',
-          'clientVersion'     => 2,
-          'clientDescription' => php_uname('n').':'.$description,
-          'user'              => $user_name,
-          'certificate'       => $certificate,
-        ));
-    } catch (ConduitClientException $ex) {
-      if ($ex->getErrorCode() == 'ERR-NO-CERTIFICATE') {
-        $message =
-          "\n\n".
-          phutil_console_format(
-            "YOU NEED TO __INSTALL A CERTIFICATE__ TO LOGIN TO PHABRICATOR").
-          "\n\n".
-          "The server '{$conduit_uri}' rejected your request:".
-          "\n\n".
-          $ex->getMessage().
-          "\n\n";
-        $hosts_with_cert = ifilter($hosts_config, 'cert');
-        if (!empty($hosts_with_cert)) {
-          if (count($hosts_with_cert) == 1) {
-            $message .=
-              "You currently have a certificate installed for one host:\n\n";
-          } else {
-            $message .=
-              "You currently have certificates installed for these hosts:\n\n";
-          }
-          $message .= '    '.implode("\n    ", array_keys($hosts_with_cert));
-          $message .= "\n";
-        }
-        throw new ArcanistUsageException($message);
-      } else {
-        throw $ex;
-      }
+  if ($need_auth) {
+    if (!$user_name || !$certificate) {
+      throw new ArcanistUsageException(
+        phutil_console_format(
+          "YOU NEED TO __INSTALL A CERTIFICATE__ TO LOGIN TO PHABRICATOR\n\n".
+          "You are trying to connect to '{$conduit_uri}' but do not have ".
+          "a certificate installed for this host. Run:\n\n".
+          "      $ **arc install-certificate**\n\n".
+          "...to install one."));
     }
-
-    $workflow->setUserName($user_name);
-    $user_phid = idx($connection, 'userPHID');
-    if ($user_phid) {
-      $set_guid = true;
-      $workflow->setUserGUID($user_phid);
-    }
+    $workflow->authenticateConduit();
   }
 
   if ($need_repository_api) {
@@ -244,32 +252,10 @@ try {
     $workflow->setRepositoryAPI($repository_api);
   }
 
-  if ($need_auth && !$set_guid) {
-    $user_name = getenv('USER');
-    $user_find_future = $conduit->callMethod(
-      'user.find',
-      array(
-        'aliases' => array(
-          $user_name,
-        ),
-      ));
-    $user_guids = $user_find_future->resolve();
-    if (empty($user_guids[$user_name])) {
-      throw new ArcanistUsageException(
-        "Username '{$user_name}' is not recognized.");
-    }
-
-    $user_guid = $user_guids[$user_name];
-    $workflow->setUserGUID($user_guid);
-    $workflow->setUserName($user_name);
-  }
-
   $config->willRunWorkflow($command, $workflow);
   $workflow->willRunWorkflow();
   $err = $workflow->run();
-  if ($err == 0) {
-    $config->didRunWorkflow($command, $workflow);
-  }
+  $config->didRunWorkflow($command, $workflow, $err);
   exit($err);
 
 } catch (ArcanistUsageException $ex) {
